@@ -3,7 +3,7 @@ project(oslab_mrfs)
 
 set(CMAKE_CXX_STANDARD 11)
 
-add_executable(oslab_mrfs
+add_executable(test1
         mrfs.cpp
         mrfs.h
-        test.cpp)
+        test1.cpp)
