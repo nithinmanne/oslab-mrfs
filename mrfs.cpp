@@ -163,6 +163,31 @@ int mrfs::copy_pc2myfs(const char *source, const char *dest) {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
+    std::ifstream file(source);
+    std::string str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    auto fileinode = reqinode();
+    auto file = *((indexnode*)inode+fileinode);
+    file.filetype = 1;
+    file.filesize = sizeof(str);
+    file.lastModified(nullptr);
+    file.lastRead(nullptr);
+    file.acPermissions = 0666;
+    blocks_req = sizeof(str)/sizeof(block);
+    if(blocks_req<=8){
+      for(int i=0;i<blocks_req;i++){
+        file.direct[i] = reqblock();
+        sb.used_blocks++;
+        sb.blocks[file.direct[i]] = 1;
+
+        FS[i] = str.substr(,sizeof(block));
+
+      }
+    }
+
+
+
+
+
     return 0;
 }
 
