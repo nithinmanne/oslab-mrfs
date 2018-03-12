@@ -10,7 +10,10 @@
 
 class mrfs {
 private:
-    void *FS;
+    class block {
+        char data[256];
+    };
+    block *FS;
     int _key;
     bool init;
     class superblock {
@@ -24,31 +27,31 @@ private:
         int& used_blocks;
         int* blocks;
         superblock();
-        explicit superblock(void *FS);
-        superblock& operator=(void* FS);
+        superblock(block *FS);  //NOLINT
+        superblock& operator=(block* FS);
     };
     superblock sb;
-    class block {
-        char data[256];
-    };
-    block *inode;
     class indexnode {
     public:
         int filetype;
         int filesize;
         time_t lastModified;
         time_t lastRead;
+        int owner;
         int acPermissions;
         int direct[8];
         int indirect;
         int doubleindirect;
     };
+    indexnode *inode;
     inline int reqblock() {
+        if(sb.used_blocks==sb.max_blocks) return -1;
         for(int i=0;i<sb.max_blocks;i++)
             if(sb.blocks[i]==0) return i;
         return -1;
     }
     inline int16_t reqinode() {
+        if(sb.used_inodes==sb.max_inodes) return -1;
         for(int16_t i=0;i<sb.max_inodes;i++)
             if(sb.inodes[i]==0) return i;
         return -1;
@@ -58,7 +61,19 @@ private:
         char name[30];
         int16_t inode;
     };
-    int curdir;
+    int16_t curdir;
+    class blocklist {
+    public:
+        block **list;
+        int *blist;
+        int numblocks;
+        blocklist();
+        blocklist(block* FS, indexnode& inode);
+        ~blocklist();
+        inline block* operator[](int i) {
+            return list[i];
+        }
+    };
 
 public:
     const int &key;
@@ -72,8 +87,8 @@ public:
         cout<<"Max Blocks: "<<sb.max_blocks<<endl;
         cout<<"Used Blocks: "<<sb.used_blocks<<endl;
         cout<<"Super Blocks: "<<sb.block_count<<endl;
-        cout<<"Size of Inode: "<<sizeof(indexnode)<<endl;
-        cout<<"Size of Directory Listing: "<<sizeof(dirlist)<<endl;
+        cout<<"FS: "<<FS<<endl;
+        cout<<"inode: "<<inode<<endl;
     }
 
     mrfs();

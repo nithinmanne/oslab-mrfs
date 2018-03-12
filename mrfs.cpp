@@ -1,5 +1,7 @@
 #include "mrfs.h"
 
+#define OWNER 1
+
 mrfs::mrfs(): FS(nullptr), _key(0), init(false), sb(), key(_key) {}
 
 mrfs::mrfs(const int& key): _key(key), init(true), sb(), key(_key) {
@@ -16,9 +18,9 @@ mrfs::mrfs(const int& key): _key(key), init(true), sb(), key(_key) {
         std::cerr << "Shmget Failed for FS" << std::endl;
         exit(1);
     }
-    FS = shmat(shmid, nullptr, 0);
+    FS = (block*)shmat(shmid, nullptr, 0);
     sb = FS;
-    inode = (block*)FS + sb.block_count;
+    inode = (indexnode*)(FS + sb.block_count);
     curdir = 0;
 }
 
@@ -44,9 +46,9 @@ mrfs& mrfs::operator=(const int& key) {
         std::cerr << "Shmget Failed for size" << std::endl;
         exit(1);
     }
-    FS = shmat(shmid, nullptr, 0);
+    FS = (block*)shmat(shmid, nullptr, 0);
     sb = FS;
-    inode = (block*)FS + sb.block_count;
+    inode = (indexnode*)(FS + sb.block_count);
     curdir = 0;
     return *this;
 }
@@ -67,7 +69,7 @@ mrfs& mrfs::operator=(const mrfs& other) {
     return *this;
 }
 
-mrfs::~mrfs(){
+mrfs::~mrfs() {
     shmdt(FS);
 }
 
@@ -80,7 +82,7 @@ mrfs::superblock::superblock(): block_count(0),
                                 used_blocks(block_count),
                                 blocks(&block_count) {}
 
-mrfs::superblock::superblock(void *FS): size(*(int*)FS),
+mrfs::superblock::superblock(block *FS): size(*(int*)FS),
                                         max_inodes(*(&size+1)),
                                         used_inodes(*(&max_inodes+1)),
                                         inodes(&used_inodes+1),
@@ -93,9 +95,47 @@ mrfs::superblock::superblock(void *FS): size(*(int*)FS),
     block_count = block_count/sizeof(block) + (block_count%sizeof(block)>0);
 }
 
-mrfs::superblock& mrfs::superblock::operator=(void* FS) {
+mrfs::superblock& mrfs::superblock::operator=(block* FS) {
     new (this) superblock(FS);
     return *this;
+}
+
+mrfs::blocklist::blocklist(): list(nullptr), blist(nullptr), numblocks(0) {}
+
+mrfs::blocklist::blocklist(block* FS, indexnode& inode) {
+    unsigned int num_blocks = inode.filesize/sizeof(block) + (inode.filesize%sizeof(block)>0);
+    numblocks = num_blocks;
+    list = new block*[num_blocks];
+    blist = new int[num_blocks];
+    unsigned int i=0;
+    for(;i<8;i++) {
+        if(i==num_blocks) return;
+        list[i] = FS + inode.direct[i];
+        blist[i] = inode.direct[i];
+    }
+    auto indirect = (int*)(FS + inode.indirect);
+    for(unsigned int j=0;j<sizeof(block)/sizeof inode.indirect;i++,j++) {
+        if(i==num_blocks) return;
+        list[i] = FS + *indirect;
+        blist[i] = *indirect;
+        indirect++;
+    }
+    auto doubleindirect = (int*)(FS + inode.doubleindirect);
+    for(unsigned int j=0;j<sizeof(block)/sizeof inode.doubleindirect;j++) {
+        auto dindirect = (int*)(FS + *doubleindirect);
+        for(unsigned int k=0;k<sizeof(block)/sizeof inode.indirect;i++,k++) {
+            if(i==num_blocks) return;
+            list[i] = FS + *dindirect;
+            blist[i] = *dindirect;
+            dindirect++;
+        }
+        doubleindirect++;
+    }
+
+}
+
+mrfs::blocklist::~blocklist() {
+    delete [] list;
 }
 
 int mrfs::create_myfs(int size){
@@ -112,7 +152,7 @@ int mrfs::create_myfs(int size){
         std::cerr << "Shmget Failed for FS" << std::endl;
         return -1;
     }
-    FS = shmat(shmid, nullptr, 0);
+    FS = (block*)shmat(shmid, nullptr, 0);
     init = true;
     sb = FS;
     sb.size = bsize;
@@ -132,7 +172,7 @@ int mrfs::create_myfs(int size){
         sb.blocks[i+sb.used_blocks] = 1;
     }
     sb.used_blocks += sb.block_count;
-    inode = (block*)FS + sb.block_count;
+    inode = (indexnode*)(FS + sb.block_count);
     int inode_blocks = sizeof(indexnode)*sb.max_inodes;
     inode_blocks = inode_blocks/sizeof(block) + (inode_blocks%sizeof(block)>0);
     for (int i=0;i<inode_blocks;i++){
@@ -140,20 +180,21 @@ int mrfs::create_myfs(int size){
     }
     sb.used_blocks += inode_blocks;
     auto rootinode = reqinode();
-    auto root = *((indexnode*)inode+rootinode);
+    sb.used_inodes++;
+    sb.inodes[rootinode] = 1;
+    auto& root = *(inode+rootinode);
     root.filetype = 1;
-    root.filesize = sizeof(indexnode);
+    root.filesize = sizeof(dirlist);
     root.lastModified = time(nullptr);
     root.lastRead = time(nullptr);
     root.acPermissions = 0666;
+    root.owner = OWNER;
     root.direct[0] = reqblock();
     sb.used_blocks++;
     sb.blocks[root.direct[0]] = 1;
-    dirlist rootdot = *(dirlist*)((block*)FS + root.direct[0]);
+    auto& rootdot = *(dirlist*)(FS + root.direct[0]);
     strcpy(rootdot.name, ".");
     rootdot.inode = rootinode;
-    sb.used_inodes++;
-    sb.inodes[rootdot.inode] = 1;
     curdir = rootdot.inode;
     return 0;
 }
@@ -163,31 +204,29 @@ int mrfs::copy_pc2myfs(const char *source, const char *dest) {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
-    std::ifstream file(source);
-    std::string str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    auto fileinode = reqinode();
-    auto file = *((indexnode*)inode+fileinode);
-    file.filetype = 1;
-    file.filesize = sizeof(str);
-    file.lastModified(nullptr);
-    file.lastRead(nullptr);
-    file.acPermissions = 0666;
-    blocks_req = sizeof(str)/sizeof(block);
-    if(blocks_req<=8){
-      for(int i=0;i<blocks_req;i++){
-        file.direct[i] = reqblock();
-        sb.used_blocks++;
-        sb.blocks[file.direct[i]] = 1;
-
-        FS[i] = str.substr(,sizeof(block));
-
-      }
+    std::ifstream source_file;
+    source_file.open(source, std::ios::in);
+    if(source_file.fail()) {
+        std::cerr << "File Open Failed" << std::endl;
+        return -1;
     }
-
-
-
-
-
+    auto fileinode = reqinode();
+    if(fileinode==-1) {
+        std::cerr << "Inode Allocation Failed" << std::endl;
+        return -1;
+    }
+    sb.used_inodes++;
+    sb.inodes[fileinode] = 1;
+    auto& file = *(inode+fileinode);
+    file.filetype = 0;
+    file.filesize = 0;
+    file.lastModified = time(nullptr);
+    file.lastRead = time(nullptr);
+    file.acPermissions = 0666;
+    file.owner = OWNER;
+    while(!source_file.eof()) {
+        if(file.filesize);
+    }
     return 0;
 }
 
@@ -196,7 +235,38 @@ int mrfs::copy_myfs2pc(const char *source, const char *dest) const {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
-    return 0;
+    auto& curdir_inode = *(inode+curdir);
+    int num_files;
+    blocklist curdir_blocks(FS, curdir_inode);
+    for (int i = 0; i<curdir_blocks.numblocks; i++){
+        auto curdir_files = (dirlist*)(curdir_blocks[i]);
+        num_files = sizeof(block)/sizeof(dirlist);
+        if(i==curdir_blocks.numblocks-1) num_files = curdir_inode.filesize/sizeof(dirlist)-i*num_files;
+        for(int j=0;i<num_files;i++)
+            if(strcmp(curdir_files[i].name, source)==0) {
+                auto& file_inode = *(inode+curdir_files[j].inode);
+                if(file_inode.filetype==1) {
+                    std::cerr << "Directory, Not File" << std::endl;
+                    return -1;
+                }
+                std::ofstream dest_file;
+                dest_file.open(dest, std::ios::out|std::ios::binary);
+                if(dest_file.fail()) {
+                    std::cerr << "Destination File Open Failed" << std::endl;
+                    return -1;
+                }
+                blocklist file_blocks(FS, file_inode);
+                for(int k = 0; i<file_blocks.numblocks;i++)
+                    if(k==file_blocks.numblocks-1)
+                        dest_file.write((char*) file_blocks[k], file_inode.filesize - k * sizeof(block));
+                    else
+                        dest_file.write((char*)file_blocks[k], sizeof(block));
+                dest_file.close();
+                return 0;
+            }
+    }
+    std::cerr << "Source File Not Found" << std::endl;
+    return -1;
 }
 
 int mrfs::rm_myfs(const char *filename) {
@@ -212,17 +282,48 @@ int mrfs::showfile_myfs(const char *filename) const {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
-    return 0;
+    auto& curdir_inode = *(inode+curdir);
+    int num_files;
+    blocklist curdir_blocks(FS, curdir_inode);
+    for (int i = 0; i<curdir_blocks.numblocks; i++){
+        auto curdir_files = (dirlist*)(curdir_blocks[i]);
+        num_files = sizeof(block)/sizeof(dirlist);
+        if(i==curdir_blocks.numblocks-1) num_files = curdir_inode.filesize/sizeof(dirlist)-i*num_files;
+        for(int j=0;i<num_files;i++)
+            if(strcmp(curdir_files[i].name, filename)==0) {
+                auto& file_inode = *(inode+curdir_files[j].inode);
+                if(file_inode.filetype==1) {
+                    std::cerr << "Directory, Not File" << std::endl;
+                    return -1;
+                }
+                blocklist file_blocks(FS, file_inode);
+                for(int k = 0; i<file_blocks.numblocks;i++)
+                    if(k==file_blocks.numblocks-1)
+                        std::cout.write((char*)file_blocks[k], file_inode.filesize-k*sizeof(block));
+                    else
+                        std::cout.write((char*)file_blocks[k], sizeof(block));
+                return 0;
+            }
+    }
+    std::cerr << "File Not Found" << std::endl;
+    return -1;
 }
-
 int mrfs::ls_myfs() const {
     if(!init) {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
-    auto inodelist = (indexnode*)inode;
-    for(int i=0;i<inodelist[curdir].filesize/sizeof(dirlist);i++) {
-
+    auto& curdir_inode = *(inode+curdir);
+    int num_files;
+    blocklist curdir_blocks(FS, curdir_inode);
+    for(int i=0;i<curdir_blocks.numblocks;i++) {
+        auto curdir_files = (dirlist*)(curdir_blocks[i]);
+        num_files = sizeof(block)/sizeof(dirlist);
+        if(i==curdir_blocks.numblocks-1) num_files = curdir_inode.filesize/sizeof(dirlist)-i*num_files;
+        for(int j=0;j<num_files;j++){
+            auto& file_inode = *(inode+curdir_files[j].inode);
+            std::cout << file_inode.acPermissions << " " << file_inode.owner << " " << file_inode.filesize << " " << curdir_files[j].name << std::endl;
+        }
     }
     return 0;
 }
@@ -232,6 +333,33 @@ int mrfs::mkdir_myfs(const char *dirname) {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
+    auto dirinode = reqinode();
+    if(dirinode==-1) {
+        std::cerr << "Out Of inodes" << std::endl;
+        return -1;
+    }
+    sb.used_inodes++;
+    sb.inodes[dirinode] = 1;
+    auto& dir = *(inode+dirinode);
+    dir.filetype = 1;
+    dir.filesize = 2*sizeof(dirlist);
+    dir.lastModified = time(nullptr);
+    dir.lastRead = time(nullptr);
+    dir.acPermissions = 0666;
+    dir.owner = OWNER;
+    dir.direct[0] = reqblock();
+    if(dir.direct[0]==-1) {
+        std::cerr << "Out Of blocks, Filesystem Corrupted" << std::endl;
+        return -1;
+    }
+    sb.used_blocks++;
+    sb.blocks[dir.direct[0]] = 1;
+    auto dirdot = (dirlist*)(FS + dir.direct[0]);
+    strcpy(dirdot->name, ".");
+    dirdot->inode = dirinode;
+    dirdot++;
+    strcpy(dirdot->name, "..");
+    dirdot->inode = curdir;
     return 0;
 }
 
@@ -240,7 +368,26 @@ int mrfs::chdir_myfs(const char *dirname) {
         std::cerr << "Filesystem Not Initialized" << std::endl;
         return -1;
     }
-    return 0;
+    auto& curdir_inode = *(inode+curdir);
+    int num_files;
+    blocklist curdir_blocks(FS, curdir_inode);
+    for (int i = 0; i<curdir_blocks.numblocks; i++){
+        auto curdir_files = (dirlist*)(curdir_blocks[i]);
+        num_files = sizeof(block)/sizeof(dirlist);
+        if(i==curdir_blocks.numblocks-1) num_files = curdir_inode.filesize/sizeof(dirlist)-i*num_files;
+        for(int j=0;i<num_files;i++)
+            if(strcmp(curdir_files[i].name, dirname)==0) {
+                auto& file_inode = *(inode+curdir_files[j].inode);
+                if(file_inode.filetype==0) {
+                    std::cerr << "File, Not Directory" << std::endl;
+                    return -1;
+                }
+                curdir = curdir_files[j].inode;
+                return 0;
+            }
+    }
+    std::cerr << "Directory Not Found" << std::endl;
+    return -1;
 }
 
 int mrfs::rmdir_myfs(const char *dirname) {
@@ -328,7 +475,7 @@ int mrfs::restore_myfs (const char *dumpfile) {
         std::cerr << "Shmget Failed for FS" << std::endl;
         return -1;
     }
-    FS = shmat(shmid, nullptr, 0);
+    FS = (block*)shmat(shmid, nullptr, 0);
     dump_file.seekg(0, std::ios::beg);
     dump_file.read((char*)FS, size);
     if(dump_file.fail()) {
@@ -337,6 +484,8 @@ int mrfs::restore_myfs (const char *dumpfile) {
     }
     init = true;
     sb = FS;
+    inode = (indexnode*)(FS + sb.block_count);
+    curdir = 0;
     dump_file.close();
     return 0;
 }
